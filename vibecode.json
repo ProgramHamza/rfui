@@ -1,0 +1,60 @@
+{
+	"idle_example": {
+		"session": "idle",
+		"timestamp": "2026-03-14T10:00:00Z",
+		"hardware_version": "1.0",
+		"sample_rate_hz": 50,
+		"notes": "",
+		"samples": [
+			{
+				"t": 0,
+				"vmag": 1.234,
+				"vph": 0.876
+			},
+			{
+				"t": 20,
+				"vmag": 1.231,
+				"vph": 0.879
+			}
+		],
+		"baseline": {
+			"mean_vmag": 1.2325,
+			"std_vmag": 0.0015,
+			"mean_vph": 0.8775,
+			"std_vph": 0.0015
+		}
+	},
+	"training_example": {
+		"session": "training",
+		"timestamp": "2026-03-14T10:05:00Z",
+		"hardware_version": "1.0",
+		"sample_rate_hz": 50,
+		"notes": "BTN_1 -> BTN_2 -> BTN_3 sequence",
+		"samples": [
+			{
+				"t": 0,
+				"vmag": 1.198,
+				"vph": 0.842
+			},
+			{
+				"t": 20,
+				"vmag": 1.412,
+				"vph": 0.962
+			}
+		],
+		"labels_assigned": {
+			"0": "IDLE",
+			"1": "BTN_1",
+			"2": "BTN_2",
+			"3": "BTN_3"
+		},
+		"medoid_features": [
+			[1.23, 0.01, 0.88, 0.01, 0.0, 0.0, 0.02, 0.02, 0.08, 0.07],
+			[1.35, 0.02, 0.92, 0.02, 0.01, 0.01, 0.09, 0.07, 0.14, 0.15],
+			[1.47, 0.02, 1.01, 0.03, 0.01, 0.01, 0.1, 0.08, 0.12, 0.11],
+			[1.58, 0.03, 1.08, 0.03, 0.01, 0.02, 0.11, 0.09, 0.1, 0.09]
+		],
+		"intra_cluster_distances": [0.12, 0.34, 0.28, 0.19]
+	}
+}
+
