@@ -1,5 +1,11 @@
 # RAFUI - Radio Frequency User Interface
 
+## Prototype Preview
+
+<p align="center">
+  <img src="rafui_prototype_1.jpg" alt="RAFUI prototype" width="320" />
+</p>
+
 ## Description
 RAFUI is a user input interface that uses skin as a 2D input surface by reading phase shift and magnitude difference of an RF signal.
 
