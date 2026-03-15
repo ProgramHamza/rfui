@@ -86,12 +86,18 @@ def extract_features(window: np.ndarray) -> np.ndarray:
 	)
 
 
-def train(data_path: str, idle_baseline: dict[str, float]) -> RafuiModel:
+def train(
+	data_path: str,
+	idle_baseline: dict[str, float],
+	*,
+	show_plot: bool = True,
+) -> RafuiModel:
 	"""Train RAFUI model from captured training session JSON.
 
 	Args:
 		data_path: Path to training session JSON file.
 		idle_baseline: Baseline dict from idle calibration module.
+		show_plot: If True, show training cluster scatter plot.
 
 	Returns:
 		Trained RafuiModel object.
@@ -132,7 +138,8 @@ def train(data_path: str, idle_baseline: dict[str, float]) -> RafuiModel:
 		intra_cluster_distances=intra_cluster,
 	)
 
-	_plot_training_clusters(feature_matrix, cluster_indices, medoid_unscaled, label_map)
+	if show_plot:
+		_plot_training_clusters(feature_matrix, cluster_indices, medoid_unscaled, label_map)
 	return model
 
 

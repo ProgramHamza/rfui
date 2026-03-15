@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -26,10 +27,17 @@ from rafui_recog_model_vibecode import (
     NOISE_LABEL,
     WINDOW_SIZE,
     detect_transition,
-    load_model,
-    predict,
-    save_model,
-    train,
+    load_model as load_model_v1,
+    predict as predict_v1,
+    save_model as save_model_v1,
+    train as train_v1,
+    extract_features,
+)
+from rafui_recog_model_2_vibecode import (
+    load_model as load_model_v2,
+    predict as predict_v2,
+    save_model as save_model_v2,
+    train_from_period_file,
 )
 
 matplotlib.use("TkAgg")
@@ -37,16 +45,26 @@ matplotlib.use("TkAgg")
 APP_TITLE = "RAFUI Operator"
 JSON_DIR_NAME = "json"
 MODEL_DIR_NAME = "models"
+MODEL_GRAPH_DIR_NAME = "modelgraphs"
 MODEL_FILE_PREFIX = "rafui_model"
+MODEL2_FILE_PREFIX = "rafui_model2"
 UI_POLL_MS = 80
 PLOT_WINDOW_SECONDS = 5.0
 MAX_LOG_LINES = 20
 DEFAULT_IDLE_DURATION_S = 10.0
-DEFAULT_TRAINING_DURATION_S = 20.0
 TRAINING_FILE_GLOB = "training_*.json"
 PICKLE_GLOB = "*.pkl"
 HARDWARE_VERSION = "1.0"
 EXPECTED_SAMPLE_RATE_HZ = 50
+CLUSTER_PLOT_MAX_POINTS = 250
+
+STATE_DISPLAY_MAP = {
+    IDLE_LABEL: "idle",
+    "BTN_1": "but1",
+    "BTN_2": "but2",
+    "BTN_3": "but3",
+    NOISE_LABEL: "idle",
+}
 
 STATE_COLORS = {
     IDLE_LABEL: "#f3f4f6",
@@ -78,12 +96,15 @@ class RafuiOperatorApp(tk.Tk):
         self.project_root = Path(__file__).resolve().parent
         self.json_dir = self.project_root / JSON_DIR_NAME
         self.model_dir = self.project_root / MODEL_DIR_NAME
+        self.model_graph_dir = self.project_root / MODEL_GRAPH_DIR_NAME
         self.json_dir.mkdir(parents=True, exist_ok=True)
         self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.model_graph_dir.mkdir(parents=True, exist_ok=True)
 
         self.ble_client: RafuiBLEClient | None = None
         self.idle_baseline: dict[str, float] | None = None
         self.model = None
+        self.model_version = 1
 
         self.ui_queue: queue.Queue[UiEvent] = queue.Queue()
         self.stop_worker_event = threading.Event()
@@ -92,9 +113,14 @@ class RafuiOperatorApp(tk.Tk):
         self.sample_times_s: deque[float] = deque()
         self.sample_vmag: deque[float] = deque()
         self.sample_vph: deque[float] = deque()
+        self.cluster_vmag: deque[float] = deque(maxlen=CLUSTER_PLOT_MAX_POINTS)
+        self.cluster_vph: deque[float] = deque(maxlen=CLUSTER_PLOT_MAX_POINTS)
+        self.cluster_states: deque[str] = deque(maxlen=CLUSTER_PLOT_MAX_POINTS)
         self.current_state = IDLE_LABEL
         self.current_confidence = 0.0
         self.is_busy = False
+        self.training_capture_active = False
+        self.training_capture_stop_event: threading.Event | None = None
 
         self._build_layout()
         self._set_phase_disconnected()
@@ -109,6 +135,7 @@ class RafuiOperatorApp(tk.Tk):
         self.ble_status_var = tk.StringVar(value="BLE: Disconnected")
         self.state_var = tk.StringVar(value=f"State: {IDLE_LABEL}")
         self.conf_var = tk.StringVar(value="Confidence: 0.0%")
+        self.touch_state_var = tk.StringVar(value="Touch: idle")
 
         tk.Label(status_frame, textvariable=self.ble_status_var, width=25, anchor="w").pack(side=tk.LEFT)
         tk.Label(status_frame, textvariable=self.state_var, width=20, anchor="w").pack(side=tk.LEFT, padx=(12, 0))
@@ -134,6 +161,17 @@ class RafuiOperatorApp(tk.Tk):
         self.run_button = tk.Button(button_frame, text="Run Recognition", width=18, command=self._toggle_run)
         self.run_button.pack(side=tk.LEFT, padx=4)
 
+        # Model 2 period capture buttons
+        self.period_buttons = {}
+        period_labels = ["IDLE", "BTN_1", "BTN_2", "BTN_3"]
+        for label in period_labels:
+            btn = tk.Button(button_frame, text=f"Record {label}", width=14, command=lambda l=label: self._record_period(l))
+            btn.pack(side=tk.LEFT, padx=2)
+            self.period_buttons[label] = btn
+
+        self.finish_periods_button = tk.Button(button_frame, text="Finish Periods & Train", width=18, command=self._finish_periods_and_train)
+        self.finish_periods_button.pack(side=tk.LEFT, padx=4)
+
         content = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief=tk.RAISED)
         content.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
@@ -146,20 +184,53 @@ class RafuiOperatorApp(tk.Tk):
         self.log_panel = scrolledtext.ScrolledText(left_panel, wrap=tk.WORD, height=38, state=tk.DISABLED)
         self.log_panel.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
 
-        self.figure = Figure(figsize=(8.2, 4.8), dpi=100)
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_title("VMAG / VPH Rolling Window")
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Voltage (V)")
-        self.ax.grid(alpha=0.25)
+        right_container = tk.Frame(right_panel)
+        right_container.pack(fill=tk.BOTH, expand=True)
 
-        self.vmag_line, = self.ax.plot([], [], label="VMAG", color="#1d4ed8", linewidth=2.0)
-        self.vph_line, = self.ax.plot([], [], label="VPH", color="#b91c1c", linewidth=2.0)
-        self.ax.legend(loc="upper right")
-        self.ax.set_facecolor(STATE_COLORS[IDLE_LABEL])
+        plot_frame = tk.Frame(right_container)
+        plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.canvas = FigureCanvasTkAgg(self.figure, master=right_panel)
+        info_frame = tk.Frame(right_container, padx=10, pady=10)
+        info_frame.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.figure = Figure(figsize=(8.4, 6.4), dpi=100)
+        self.ax_raw = self.figure.add_subplot(211)
+        self.ax_cluster = self.figure.add_subplot(212)
+
+        self.ax_raw.set_title("Raw Signals (VMAG / VPH)")
+        self.ax_raw.set_xlabel("Time (s)")
+        self.ax_raw.set_ylabel("Voltage (V)")
+        self.ax_raw.grid(alpha=0.25)
+
+        self.vmag_line, = self.ax_raw.plot([], [], label="VMAG", color="#1d4ed8", linewidth=2.0)
+        self.vph_line, = self.ax_raw.plot([], [], label="VPH", color="#b91c1c", linewidth=2.0)
+        self.ax_raw.legend(loc="upper right")
+        self.ax_raw.set_facecolor(STATE_COLORS[IDLE_LABEL])
+
+        self.ax_cluster.set_title("Cluster Assignment (Current Point)")
+        self.ax_cluster.set_xlabel("VMAG (V)")
+        self.ax_cluster.set_ylabel("VPH (V)")
+        self.ax_cluster.grid(alpha=0.25)
+        self.ax_cluster.set_xlim(0.0, 3.3)
+        self.ax_cluster.set_ylim(0.0, 3.3)
+
+        self.cluster_scatter = self.ax_cluster.scatter([], [], s=20, alpha=0.45)
+        self.cluster_current, = self.ax_cluster.plot(
+            [],
+            [],
+            marker="o",
+            markersize=10,
+            markerfacecolor="none",
+            markeredgewidth=2,
+            markeredgecolor="black",
+            linestyle="None",
+        )
+
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(info_frame, text="Current Touch", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
+        tk.Label(info_frame, textvariable=self.touch_state_var, font=("Segoe UI", 16, "bold")).pack(anchor="w")
 
     def _set_phase_disconnected(self) -> None:
         """Update button states for disconnected phase."""
@@ -269,6 +340,111 @@ class RafuiOperatorApp(tk.Tk):
 
     def _train_model(self) -> None:
         """Train model from selected training JSON file."""
+        if self.training_capture_active:
+            self._append_log("Stopping training capture...")
+            if self.training_capture_stop_event is not None:
+                self.training_capture_stop_event.set()
+            self.train_button.config(text="Stopping...", state=tk.DISABLED)
+            return
+
+        selected_model_version = self._choose_model_version()
+        if selected_model_version is None:
+            return
+        self.model_version = selected_model_version
+
+        if self.model_version == 2:
+            # Model 2: Use period capture buttons
+            self._set_busy(False)
+            self._clear_plot()
+            self.period_records = []
+            self.period_capture_active = True
+            self._append_log("Model 2 period capture mode enabled. Use the buttons to record each period.")
+            return
+
+    def _record_period(self, label):
+        if not hasattr(self, "period_capture_active") or not self.period_capture_active:
+            self._append_log("Model 2 period capture not active.")
+            return
+        self._set_busy(True, reason=f"Capturing period: {label}...")
+        self._clear_plot()
+        stop_event = threading.Event()
+
+        def task():
+            try:
+                samples = asyncio.run(
+                    self._capture_samples_async(
+                        mode_label=f"PERIOD_{label}",
+                        stop_event=stop_event,
+                    )
+                )
+            except Exception as exc:
+                self._append_log(f"Period {label} capture failed: {exc}")
+                self._set_busy(False)
+                return
+            elapsed = samples[-1]["t"] - samples[0]["t"] if samples else 0
+            record = {
+                "label": label,
+                "started_at_iso": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "ended_at_iso": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "elapsed_s": elapsed / 1000.0,
+                "sample_count": len(samples),
+                "samples": samples,
+            }
+            if not hasattr(self, "period_records"):
+                self.period_records = []
+            self.period_records.append(record)
+            self._set_busy(False)
+            self._append_log(f"Period {label} recorded: {len(samples)} samples.")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _finish_periods_and_train(self):
+        if not hasattr(self, "period_capture_active") or not self.period_capture_active:
+            self._append_log("Model 2 period capture not active.")
+            return
+        if not hasattr(self, "period_records") or not self.period_records:
+            self._append_log("No periods recorded. Training aborted.")
+            return
+
+        # Stop any ongoing period capture
+        if hasattr(self, "_period_capture_thread") and self._period_capture_thread is not None:
+            try:
+                self._period_capture_thread.join(timeout=1)
+            except Exception:
+                pass
+            self._period_capture_thread = None
+
+        self.period_capture_active = False
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        period_path = self.json_dir / f"periods_{stamp}.json"
+        with open(period_path, "w", encoding="utf-8") as f:
+            json.dump(self.period_records, f, indent=2)
+        self._append_log(f"Periods saved to {period_path.name}")
+
+        def task_model2() -> None:
+            try:
+                trained_model = train_from_period_file(str(period_path))
+                model_path = self.model_dir / f"{MODEL2_FILE_PREFIX}_{stamp}.pkl"
+                save_model_v2(trained_model, model_path)
+                self.ui_queue.put(
+                    UiEvent(
+                        "train_done",
+                        {
+                            "model": trained_model,
+                            "path": str(model_path),
+                            "training_path": str(period_path),
+                            "model_version": 2,
+                        },
+                    )
+                )
+            except Exception as exc:
+                self.ui_queue.put(UiEvent("error", {"message": f"Training failed: {exc}"}))
+            finally:
+                self.ui_queue.put(UiEvent("busy_done", {}))
+
+        self._set_busy(True, reason=f"Training Model 2 from {period_path.name}...")
+        threading.Thread(target=task_model2, daemon=True).start()
+
         if self.idle_baseline is None:
             messagebox.showwarning("RAFUI", "Calibrate idle first.")
             return
@@ -276,20 +452,23 @@ class RafuiOperatorApp(tk.Tk):
         should_record = messagebox.askyesno(
             "RAFUI Training",
             "Record a new training session now?\n\n"
-            "Yes: capture ~20s while touching BTN_1, BTN_2, BTN_3 in sequence.\n"
+            "Yes: start capture now and stop it manually with the Train Model button\n"
+            "when you finish touching BTN_1, BTN_2, BTN_3 in sequence.\n"
             "No: select an existing training JSON file.",
         )
 
         if should_record:
-            self._set_busy(True, reason="Training capture started. Touch BTN_1 -> BTN_2 -> BTN_3 repeatedly.")
+            self._set_training_capture_mode(True)
+            self._append_log("Training capture started. Touch BTN_1 -> BTN_2 -> BTN_3 repeatedly, then press Train Model to stop.")
             self._clear_plot()
+            self.training_capture_stop_event = threading.Event()
 
             def task_record_and_train() -> None:
                 try:
                     samples = asyncio.run(
                         self._capture_samples_async(
-                            duration_s=DEFAULT_TRAINING_DURATION_S,
                             mode_label="TRAINING_CAPTURE",
+                            stop_event=self.training_capture_stop_event,
                         )
                     )
                     training_path = self._write_session_json(
@@ -299,14 +478,25 @@ class RafuiOperatorApp(tk.Tk):
                     )
                     self.ui_queue.put(UiEvent("training_recorded", {"path": str(training_path), "count": len(samples)}))
 
-                    trained_model = train(str(training_path), self.idle_baseline or {})
+                    trained_model = train_v1(str(training_path), self.idle_baseline or {}, show_plot=False)
                     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
                     model_path = self.model_dir / f"{MODEL_FILE_PREFIX}_{stamp}.pkl"
-                    save_model(trained_model, model_path)
-                    self.ui_queue.put(UiEvent("train_done", {"model": trained_model, "path": str(model_path)}))
+                    save_model_v1(trained_model, model_path)
+                    self.ui_queue.put(
+                        UiEvent(
+                            "train_done",
+                            {
+                                "model": trained_model,
+                                "path": str(model_path),
+                                "training_path": str(training_path),
+                                "model_version": 1,
+                            },
+                        )
+                    )
                 except Exception as exc:
                     self.ui_queue.put(UiEvent("error", {"message": f"Training failed: {exc}"}))
                 finally:
+                    self.ui_queue.put(UiEvent("training_capture_finished", {}))
                     self.ui_queue.put(UiEvent("busy_done", {}))
 
             threading.Thread(target=task_record_and_train, daemon=True).start()
@@ -323,11 +513,21 @@ class RafuiOperatorApp(tk.Tk):
 
         def task() -> None:
             try:
-                trained_model = train(path, self.idle_baseline or {})
+                trained_model = train_v1(path, self.idle_baseline or {}, show_plot=False)
                 stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
                 model_path = self.model_dir / f"{MODEL_FILE_PREFIX}_{stamp}.pkl"
-                save_model(trained_model, model_path)
-                self.ui_queue.put(UiEvent("train_done", {"model": trained_model, "path": str(model_path)}))
+                save_model_v1(trained_model, model_path)
+                self.ui_queue.put(
+                    UiEvent(
+                        "train_done",
+                        {
+                            "model": trained_model,
+                            "path": str(model_path),
+                            "training_path": str(path),
+                            "model_version": 1,
+                        },
+                    )
+                )
             except Exception as exc:
                 self.ui_queue.put(UiEvent("error", {"message": f"Training failed: {exc}"}))
             finally:
@@ -346,13 +546,21 @@ class RafuiOperatorApp(tk.Tk):
             return
 
         if self.model is None:
-            latest_model = self._latest_model_path()
+            selected_model_version = self._choose_model_version()
+            if selected_model_version is None:
+                return
+            self.model_version = selected_model_version
+
+            latest_model = self._latest_model_path(self.model_version)
             if latest_model is None:
                 messagebox.showwarning("RAFUI", "No model file found. Train model first.")
                 return
             try:
-                self.model = load_model(latest_model)
-                self._append_log(f"Loaded model: {latest_model.name}")
+                if self.model_version == 2:
+                    self.model = load_model_v2(latest_model)
+                else:
+                    self.model = load_model_v1(latest_model)
+                self._append_log(f"Loaded model v{self.model_version}: {latest_model.name}")
             except Exception as exc:
                 messagebox.showerror("RAFUI", f"Failed to load model: {exc}")
                 return
@@ -367,7 +575,8 @@ class RafuiOperatorApp(tk.Tk):
         """BLE + inference worker running outside Tk main thread."""
         assert self.model is not None
 
-        local_client = RafuiBLEClient()
+        address = self.ble_client.address if self.ble_client is not None else None
+        local_client = RafuiBLEClient(address=address)
         prev_state = IDLE_LABEL
         rolling_samples: deque[dict[str, float]] = deque(maxlen=WINDOW_SIZE)
 
@@ -386,7 +595,10 @@ class RafuiOperatorApp(tk.Tk):
                     [[item["vmag"], item["vph"]] for item in rolling_samples],
                     dtype=np.float64,
                 )
-                inferred_state, confidence = predict(raw, self.model)
+                if self.model_version == 2:
+                    inferred_state, confidence = predict_v2(raw, self.model)
+                else:
+                    inferred_state, confidence = predict_v1(raw, self.model)
                 transition = detect_transition(prev_state, inferred_state, confidence)
                 prev_state = inferred_state
 
@@ -453,8 +665,12 @@ class RafuiOperatorApp(tk.Tk):
 
         if event.event_type == "train_done":
             self.model = event.payload["model"]
+            self.model_version = int(event.payload.get("model_version", 1))
             self._append_log(f"Model trained and saved to {event.payload['path']}")
             self._set_phase_model_ready()
+            training_path = str(event.payload.get("training_path", ""))
+            if training_path and self.model_version == 1:
+                self._show_training_cluster_plot(training_path)
             return
 
         if event.event_type == "sample":
@@ -466,7 +682,9 @@ class RafuiOperatorApp(tk.Tk):
             self.current_confidence = confidence
             self.state_var.set(f"State: {state}")
             self.conf_var.set(f"Confidence: {confidence * 100.0:.1f}%")
-            self.ax.set_facecolor(STATE_COLORS.get(state, STATE_COLORS[NOISE_LABEL]))
+            self.touch_state_var.set(f"Touch: {STATE_DISPLAY_MAP.get(state, 'idle')}")
+            self.ax_raw.set_facecolor(STATE_COLORS.get(state, STATE_COLORS[NOISE_LABEL]))
+            self._update_cluster_plot(sample=sample, state=state)
             self.canvas.draw_idle()
 
             transition = event.payload.get("transition")
@@ -481,6 +699,10 @@ class RafuiOperatorApp(tk.Tk):
 
         if event.event_type == "busy_done":
             self._set_busy(False)
+            return
+
+        if event.event_type == "training_capture_finished":
+            self._set_training_capture_mode(False)
             return
 
         if event.event_type == "error":
@@ -510,7 +732,7 @@ class RafuiOperatorApp(tk.Tk):
         self.vmag_line.set_data(xs, np.array(self.sample_vmag, dtype=np.float64))
         self.vph_line.set_data(xs, np.array(self.sample_vph, dtype=np.float64))
 
-        self.ax.set_xlim(max(0.0, float(xs.min())), max(PLOT_WINDOW_SECONDS, float(xs.max()) + 0.2))
+        self.ax_raw.set_xlim(max(0.0, float(xs.min())), max(PLOT_WINDOW_SECONDS, float(xs.max()) + 0.2))
 
         y_all = np.concatenate(
             [
@@ -521,7 +743,38 @@ class RafuiOperatorApp(tk.Tk):
         y_min = float(np.min(y_all))
         y_max = float(np.max(y_all))
         margin = max((y_max - y_min) * 0.2, 0.05)
-        self.ax.set_ylim(y_min - margin, y_max + margin)
+        self.ax_raw.set_ylim(y_min - margin, y_max + margin)
+
+    def _update_cluster_plot(self, *, sample: dict[str, float], state: str) -> None:
+        """Update VMAG-VPH scatter and highlight currently assigned state point."""
+        vmag = float(sample["vmag"])
+        vph = float(sample["vph"])
+        self.cluster_vmag.append(vmag)
+        self.cluster_vph.append(vph)
+        self.cluster_states.append(state)
+
+        self.ax_cluster.cla()
+        self.ax_cluster.set_title("Cluster Assignment (Current Point)")
+        self.ax_cluster.set_xlabel("VMAG (V)")
+        self.ax_cluster.set_ylabel("VPH (V)")
+        self.ax_cluster.grid(alpha=0.25)
+
+        if self.cluster_vmag:
+            x = np.array(self.cluster_vmag, dtype=np.float64)
+            y = np.array(self.cluster_vph, dtype=np.float64)
+            colors = [STATE_COLORS.get(label, STATE_COLORS[NOISE_LABEL]) for label in self.cluster_states]
+            self.ax_cluster.scatter(x, y, c=colors, s=20, alpha=0.45)
+            self.ax_cluster.scatter([x[-1]], [y[-1]], s=100, facecolors="none", edgecolors="black", linewidths=2)
+
+            x_min, x_max = float(np.min(x)), float(np.max(x))
+            y_min, y_max = float(np.min(y)), float(np.max(y))
+            x_margin = max((x_max - x_min) * 0.2, 0.05)
+            y_margin = max((y_max - y_min) * 0.2, 0.05)
+            self.ax_cluster.set_xlim(max(0.0, x_min - x_margin), min(3.3, x_max + x_margin))
+            self.ax_cluster.set_ylim(max(0.0, y_min - y_margin), min(3.3, y_max + y_margin))
+        else:
+            self.ax_cluster.set_xlim(0.0, 3.3)
+            self.ax_cluster.set_ylim(0.0, 3.3)
 
     def _append_log(self, message: str) -> None:
         """Append one message and keep only latest N lines."""
@@ -537,10 +790,28 @@ class RafuiOperatorApp(tk.Tk):
         self.log_panel.configure(state=tk.DISABLED)
         self.log_panel.see(tk.END)
 
-    def _latest_model_path(self) -> Path | None:
+    def _latest_model_path(self, model_version: int) -> Path | None:
         """Return most recent model pickle path if available."""
-        files = sorted(self.model_dir.glob(PICKLE_GLOB), key=lambda p: p.stat().st_mtime)
+        prefix = MODEL2_FILE_PREFIX if model_version == 2 else MODEL_FILE_PREFIX
+        files = sorted(self.model_dir.glob(f"{prefix}_*.pkl"), key=lambda p: p.stat().st_mtime)
         return files[-1] if files else None
+
+    def _choose_model_version(self) -> int | None:
+        """Ask user to choose model 1 or model 2.
+
+        Returns:
+            1 for model 1, 2 for model 2, None for cancel.
+        """
+        answer = messagebox.askyesnocancel(
+            "Select Training/Run Model",
+            "Choose modeling approach:\n\n"
+            "Yes = Model 1 (current window clustering)\n"
+            "No = Model 2 (period-based clustering)\n"
+            "Cancel = abort",
+        )
+        if answer is None:
+            return None
+        return 1 if answer else 2
 
     def _clear_plot(self) -> None:
         """Reset rolling plot buffers and redraw empty axes."""
@@ -549,14 +820,33 @@ class RafuiOperatorApp(tk.Tk):
         self.sample_vph.clear()
         self.vmag_line.set_data([], [])
         self.vph_line.set_data([], [])
-        self.ax.set_xlim(0.0, PLOT_WINDOW_SECONDS)
-        self.ax.set_ylim(0.0, 3.3)
-        self.ax.set_facecolor(STATE_COLORS[IDLE_LABEL])
+        self.cluster_vmag.clear()
+        self.cluster_vph.clear()
+        self.cluster_states.clear()
+        self.ax_raw.set_xlim(0.0, PLOT_WINDOW_SECONDS)
+        self.ax_raw.set_ylim(0.0, 3.3)
+        self.ax_raw.set_facecolor(STATE_COLORS[IDLE_LABEL])
+        self.ax_cluster.cla()
+        self.ax_cluster.set_title("Cluster Assignment (Current Point)")
+        self.ax_cluster.set_xlabel("VMAG (V)")
+        self.ax_cluster.set_ylabel("VPH (V)")
+        self.ax_cluster.grid(alpha=0.25)
+        self.ax_cluster.set_xlim(0.0, 3.3)
+        self.ax_cluster.set_ylim(0.0, 3.3)
+        self.touch_state_var.set("Touch: idle")
         self.canvas.draw_idle()
 
-    async def _capture_samples_async(self, duration_s: float, mode_label: str) -> list[dict[str, float]]:
-        """Capture BLE stream samples for finite duration and mirror live data to UI."""
-        if duration_s <= 0:
+    async def _capture_samples_async(
+        self,
+        *,
+        mode_label: str,
+        duration_s: float | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> list[dict[str, float]]:
+        """Capture BLE stream samples until duration elapses or stop_event is set."""
+        if duration_s is None and stop_event is None:
+            raise ValueError("Either duration_s or stop_event must be provided")
+        if duration_s is not None and duration_s <= 0:
             raise ValueError("duration_s must be > 0")
 
         address = self.ble_client.address if self.ble_client is not None else None
@@ -577,17 +867,46 @@ class RafuiOperatorApp(tk.Tk):
                     },
                 )
             )
-            if time.monotonic() - start_time >= duration_s:
+            elapsed = time.monotonic() - start_time
+            if duration_s is not None and elapsed >= duration_s:
+                local_client.stop_stream()
+            if stop_event is not None and stop_event.is_set():
+                local_client.stop_stream()
+
+        monitor_task: asyncio.Task[None] | None = None
+
+        async def monitor_stop_request() -> None:
+            while stop_event is not None and not stop_event.is_set():
+                await asyncio.sleep(0.05)
+            if stop_event is not None and stop_event.is_set():
                 local_client.stop_stream()
 
         try:
+            if stop_event is not None:
+                monitor_task = asyncio.create_task(monitor_stop_request())
             await local_client.stream(on_sample)
         finally:
+            if monitor_task is not None:
+                monitor_task.cancel()
             await local_client.disconnect()
 
         if not samples:
             raise RuntimeError(f"{mode_label} collected 0 samples")
         return samples
+
+    def _set_training_capture_mode(self, active: bool) -> None:
+        """Switch UI to/from manual training capture mode."""
+        self.training_capture_active = active
+        if active:
+            self.is_busy = True
+            self.connect_button.config(state=tk.DISABLED)
+            self.calibrate_button.config(state=tk.DISABLED)
+            self.run_button.config(state=tk.DISABLED)
+            self.train_button.config(text="Stop Training Capture", state=tk.NORMAL)
+            return
+
+        self.training_capture_stop_event = None
+        self.train_button.config(text="Train Model")
 
     def _compute_idle_baseline(self, samples: list[dict[str, float]]) -> dict[str, float]:
         """Compute idle baseline statistics from sample list."""
@@ -625,6 +944,54 @@ class RafuiOperatorApp(tk.Tk):
         output_path = self.json_dir / f"{session_type}_{timestamp_file}.json"
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return output_path
+
+    def _show_training_cluster_plot(self, training_path: str) -> None:
+        """Show training cluster scatter after model training completes."""
+        if self.model is None:
+            return
+
+        try:
+            payload = json.loads(Path(training_path).read_text(encoding="utf-8"))
+            samples = payload.get("samples", [])
+            if len(samples) < WINDOW_SIZE:
+                self._append_log("Skipping cluster plot: not enough training samples.")
+                return
+
+            values = np.array([[float(s["vmag"]), float(s["vph"])] for s in samples], dtype=np.float64)
+            rows: list[np.ndarray] = []
+            for start in range(0, len(values) - WINDOW_SIZE + 1):
+                rows.append(extract_features(values[start : start + WINDOW_SIZE]))
+            if not rows:
+                self._append_log("Skipping cluster plot: no feature windows generated.")
+                return
+
+            feature_matrix = np.vstack(rows)
+            feature_scaled = self.model.scaler.transform(feature_matrix)
+
+            deltas = feature_scaled[:, None, :] - self.model.medoid_centers_scaled[None, :, :]
+            cluster_idx = np.argmin(np.linalg.norm(deltas, axis=2), axis=1)
+
+            plt.figure("RAFUI Training Clusters", figsize=(8, 6))
+            plt.clf()
+            for idx in range(self.model.medoid_centers_unscaled.shape[0]):
+                mask = cluster_idx == idx
+                label = self.model.label_map.get(int(idx), f"CLUSTER_{idx}")
+                plt.scatter(feature_matrix[mask, 0], feature_matrix[mask, 2], s=12, alpha=0.6, label=label)
+
+            medoids = self.model.medoid_centers_unscaled
+            plt.scatter(medoids[:, 0], medoids[:, 2], s=260, marker="*", color="black", label="Medoids")
+            plt.title("RAFUI Training Clusters (mean_vmag vs mean_vph)")
+            plt.xlabel("mean_vmag")
+            plt.ylabel("mean_vph")
+            plt.legend()
+            plt.tight_layout()
+            timestamp_file = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            graph_path = self.model_graph_dir / f"cluster_graph_{timestamp_file}.png"
+            plt.savefig(graph_path, dpi=180)
+            plt.show(block=False)
+            self._append_log(f"Displayed training cluster plot and saved to {graph_path}.")
+        except Exception as exc:
+            self._append_log(f"Cluster plot display failed: {exc}")
 
     def _on_close(self) -> None:
         """Graceful shutdown of background worker and app."""
